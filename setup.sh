@@ -1,22 +1,20 @@
 #!/usr/bin/env bash
 # setup.sh — wire the Hermes Status plugin into a machine (idempotent).
 #
-# Run as your normal user (uses sudo for systemd), AFTER:
+# Run as your normal user (uses sudo only for the gateway's systemd unit), AFTER:
 #   1. Hermes is installed (~/.hermes/hermes-agent)
-#   2. status-backend + libsds are built and installed (README, "Build status-backend")
+#   2. the status-backend container is running (README, "Run status-backend in Docker")
 #   3. the plugin is installed: hermes plugins install jelly-claw/hermes-plugin-status --enable
 #
 # What it does:
-#   - installs status-backend.service (+ memory drop-in) if not present
-#   - installs a drop-in so hermes-gateway.service waits for status-backend
+#   - installs a drop-in so hermes-gateway.service starts after Docker
 #   - installs the gateway service (hermes gateway install --system) if missing
 #   - sets Hermes config: multiplex_profiles=true, group_sessions_per_user=false
 #   - installs helpers into ~/.local/bin: restart-hermes, status-agents, status-create-account
 #
 # Never overwrites an existing unit or helper unless --force is given.
 #
-# Env overrides: STATUS_PORT (21405), STATUS_LIBDIR (/usr/local/lib/status-go),
-#                HERMES_HOME (~/.hermes)
+# Env overrides: STATUS_PORT (21405), HERMES_HOME (~/.hermes)
 set -euo pipefail
 
 FORCE=0
@@ -27,7 +25,6 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 HERMES_PY="$HERMES_HOME/hermes-agent/venv/bin/python"
 PORT="${STATUS_PORT:-21405}"
-LIBDIR="${STATUS_LIBDIR:-/usr/local/lib/status-go}"
 BIN_DIR="$HOME/.local/bin"
 UNIT_DIR=/etc/systemd/system
 
@@ -40,8 +37,8 @@ hermes() { "$HERMES_PY" -m hermes_cli.main "$@"; }
 
 # ── prerequisites ───────────────────────────────────────────────────────────
 [[ -x "$HERMES_PY" ]] || die "Hermes not found at $HERMES_HOME/hermes-agent — install Hermes first"
-[[ -x /usr/local/bin/status-backend ]] || die "/usr/local/bin/status-backend missing — build it (README, 'Build status-backend')"
-[[ -f "$LIBDIR/libsds.so" ]] || warn "$LIBDIR/libsds.so not found — status-backend needs it (set STATUS_LIBDIR if it lives elsewhere)"
+curl -sf "http://127.0.0.1:$PORT/health" >/dev/null \
+  || warn "status-backend not answering on 127.0.0.1:$PORT — start the container (README, 'Run status-backend in Docker')"
 [[ -d "$HERMES_HOME/plugins/status" ]] || warn "plugin not at $HERMES_HOME/plugins/status — run: hermes plugins install jelly-claw/hermes-plugin-status --enable"
 
 install_file() {  # install_file <src> <dest> [sudo]
@@ -56,13 +53,8 @@ install_file() {  # install_file <src> <dest> [sudo]
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 
-# ── systemd: status-backend ─────────────────────────────────────────────────
+# ── systemd: gateway drop-in ────────────────────────────────────────────────
 say "systemd units"
-sed -e "s|@USER@|$USER|" -e "s|@HOME@|$HOME|" -e "s|@PORT@|$PORT|" -e "s|@LIBDIR@|$LIBDIR|" \
-  "$HERE/systemd/status-backend.service" > "$TMP/status-backend.service"
-install_file "$TMP/status-backend.service" "$UNIT_DIR/status-backend.service" sudo
-install_file "$HERE/systemd/status-backend.service.d/10-memory.conf" \
-  "$UNIT_DIR/status-backend.service.d/10-memory.conf" sudo
 install_file "$HERE/systemd/hermes-gateway.service.d/10-status-backend.conf" \
   "$UNIT_DIR/hermes-gateway.service.d/10-status-backend.conf" sudo
 
@@ -74,7 +66,7 @@ else
   sudo "$HERMES_PY" -m hermes_cli.main gateway install --system --run-as-user "$USER"
 fi
 sudo systemctl daemon-reload
-sudo systemctl enable status-backend.service hermes-gateway.service >/dev/null 2>&1 || true
+sudo systemctl enable hermes-gateway.service >/dev/null 2>&1 || true
 ok "units enabled"
 
 # ── Hermes config ───────────────────────────────────────────────────────────
@@ -108,7 +100,7 @@ if ((${#missing[@]})); then
   cat <<EOF
 
 Next steps:
-  1. sudo systemctl start status-backend
+  1. Make sure the status-backend container is running (README)
   2. New bot account:   status-create-account --name Jelly --write-env $HERMES_HOME/.env
      (migrating instead? copy the old data dir + STATUS_* lines — see README)
   3. Add STATUS_ALLOW_FROM / STATUS_HOME_CHANNEL (your chat key) — see .env.example

@@ -2,7 +2,7 @@
 # restart-hermes — all-in-one graceful (re)start of the Hermes gateway stack.
 #
 # Stack:
-#   status-backend.service   Status / Waku protocol bridge (port 21405)
+#   status-backend           Status / Waku bridge, Docker container (port 21405)
 #   hermes-gateway.service   Hermes messaging gateway (depends on status-backend)
 #
 # Default behaviour:
@@ -21,7 +21,7 @@ set -euo pipefail
 
 STATUS_PORT="${STATUS_PORT:-21405}"
 HEALTH_URL="http://127.0.0.1:${STATUS_PORT}/health"
-BACKEND_SVC="status-backend.service"
+BACKEND_CTR="${STATUS_BACKEND_CONTAINER:-status-backend}"
 GATEWAY_SVC="hermes-gateway.service"
 
 FULL=0
@@ -53,13 +53,13 @@ wait_for_backend() {
 # ── 1. status-backend ──────────────────────────────────────────────────────
 if [[ "$FULL" -eq 1 ]]; then
   cyan "Force-restarting status-backend…"
-  sudo systemctl restart "$BACKEND_SVC"
+  docker restart "$BACKEND_CTR" >/dev/null
   wait_for_backend
 elif backend_healthy; then
   green "status-backend already healthy — leaving it running"
 else
   cyan "status-backend unhealthy — (re)starting…"
-  sudo systemctl restart "$BACKEND_SVC"
+  docker restart "$BACKEND_CTR" >/dev/null
   wait_for_backend
 fi
 
@@ -73,7 +73,9 @@ fi
 # ── 3. Report ───────────────────────────────────────────────────────────────
 echo
 cyan "Service states:"
-for svc in "$BACKEND_SVC" "$GATEWAY_SVC"; do
+printf '  %-24s %s\n' "$BACKEND_CTR (docker)" \
+  "$(docker inspect -f 'status={{.State.Status}} restart={{.HostConfig.RestartPolicy.Name}}' "$BACKEND_CTR" 2>/dev/null || echo 'not found')"
+for svc in "$GATEWAY_SVC"; do
   active="$(systemctl is-active "$svc" 2>/dev/null || true)"
   enabled="$(systemctl is-enabled "$svc" 2>/dev/null || true)"
   printf '  %-24s active=%-8s enabled=%s\n' "$svc" "$active" "$enabled"
