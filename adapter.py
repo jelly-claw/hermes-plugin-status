@@ -17,7 +17,8 @@ Optional env vars:
   STATUS_PROFILE_NAME - Display name to maintain on the Status profile
   STATUS_ALLOW_FROM   - Space/comma-separated admin public keys (0x04...)
                         When set: DMs only from listed keys; groups only when
-                        an admin member is present.
+                        an admin member is present. Contact requests from
+                        these keys are accepted automatically.
   ASSISTANT_NAME      - Bot name prepended to outbound messages (default: Jelly)
 """
 
@@ -247,6 +248,8 @@ class StatusAdapter(BasePlatformAdapter):
         self._active_chats: List[Dict] = []
         self._blocked_dm_chats: Set[str] = set()
         self._logged_blocked_groups: Set[str] = set()
+        # Admin keys whose contact request failed to accept (warn once, then debug).
+        self._contact_accept_failed: Set[str] = set()
 
         self._poll_task: Optional[asyncio.Task] = None
         self._ws_task: Optional[asyncio.Task] = None
@@ -415,6 +418,7 @@ class StatusAdapter(BasePlatformAdapter):
         await self._load_settings()
         await self._sync_profile_name()
         await self._ensure_allowed_chats_active()
+        await self._accept_admin_contact_requests()
         await self._refresh_active_chats()
 
     async def _check_session(self) -> None:
@@ -444,6 +448,40 @@ class StatusAdapter(BasePlatformAdapter):
         logger.warning("Status: %s — handing to the gateway to reconnect", reason)
         self._set_fatal_error("status_session_lost", reason, retryable=True)
         await self._notify_fatal_error()
+
+    async def _accept_admin_contact_requests(self) -> None:
+        """Accept pending contact requests from STATUS_ALLOW_FROM keys.
+
+        A new bot account starts with no contacts, and an admin's contact
+        request (contentType 11) is never delivered as a message, so without
+        this the bot silently ignores its own operator. Only admin keys are
+        accepted; requests from anyone else are left for a human to decide.
+        """
+        if not self.allow_from or not self._client:
+            return
+        try:
+            contacts = await call_rpc(self._client, self.port, "wakuext_contacts", [])
+        except Exception as e:
+            logger.debug("Status: listing contacts failed: %s", e)
+            return
+        for contact in contacts if isinstance(contacts, list) else []:
+            pk = str(contact.get("id") or "")
+            if pk.lower() not in self.allow_from:
+                continue
+            if not contact.get("hasAddedUs") or contact.get("added"):
+                continue  # no pending request from them, or already accepted
+            try:
+                await call_rpc(
+                    self._client, self.port,
+                    "wakuext_acceptLatestContactRequestForContact", [{"id": pk}],
+                )
+                self._contact_accept_failed.discard(pk.lower())
+                logger.info("Status: accepted contact request from admin %s…", pk[:20])
+            except Exception as e:
+                first = pk.lower() not in self._contact_accept_failed
+                self._contact_accept_failed.add(pk.lower())
+                (logger.warning if first else logger.debug)(
+                    "Status: accepting contact request from %s… failed: %s", pk[:20], e)
 
     async def disconnect(self) -> None:
         self._running = False
@@ -554,6 +592,7 @@ class StatusAdapter(BasePlatformAdapter):
             if not await self._refresh_active_chats():
                 await self._check_session()
                 return
+            await self._accept_admin_contact_requests()
             for chat in list(self._active_chats):
                 await self._process_chat(chat)
         finally:

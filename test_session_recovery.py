@@ -1,4 +1,4 @@
-"""Lost-session recovery for the Status adapter.
+"""Lost-session recovery and admin contact-request acceptance for the Status adapter.
 
 Fakes status-backend at the call_rpc / health_check boundary; no backend, gateway or
 ~/.hermes state is touched. Run with the Hermes python (see README "Tests").
@@ -103,3 +103,40 @@ def test_core_without_fatal_handler_keeps_running():
     a = make_adapter(FakeBackend(chats_ok=False, logged_in=False), with_handler=False)
     poll(a)
     assert a._running and not a.has_fatal_error
+
+
+def test_pending_admin_contact_request_is_accepted():
+    # Regression: a new bot account never accepted its operator's contact request, so the
+    # admin's messages never reached Hermes.
+    b = FakeBackend(contacts=[{"id": ADMIN, "hasAddedUs": True, "added": False}])
+    poll(make_adapter(b))
+    assert b.accepted() == [ADMIN]
+
+
+def test_admin_key_matches_case_insensitively():
+    b = FakeBackend(contacts=[{"id": ADMIN.upper().replace("0X", "0x"), "hasAddedUs": True, "added": False}])
+    poll(make_adapter(b))
+    assert len(b.accepted()) == 1
+
+
+def test_non_admin_and_settled_contacts_are_left_alone():
+    b = FakeBackend(contacts=[
+        {"id": STRANGER, "hasAddedUs": True, "added": False},  # not an admin
+        {"id": ADMIN, "hasAddedUs": True, "added": True},       # already mutual
+    ])
+    poll(make_adapter(b))
+    assert b.accepted() == []
+
+
+def test_no_allow_from_accepts_nobody():
+    b = FakeBackend(contacts=[{"id": STRANGER, "hasAddedUs": True, "added": False}])
+    poll(make_adapter(b, allow_from=()))
+    assert b.accepted() == [] and not any(m == "wakuext_contacts" for m, _ in b.calls)
+
+
+def test_failed_accept_is_remembered_and_retried():
+    b = FakeBackend(contacts=[{"id": ADMIN, "hasAddedUs": True, "added": False}], accept_error="boom")
+    a = make_adapter(b)
+    poll(a)
+    poll(a)
+    assert len(b.accepted()) == 2 and a._contact_accept_failed == {ADMIN.lower()}
