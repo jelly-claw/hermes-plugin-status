@@ -11,15 +11,29 @@
 #   - installs the gateway service (hermes gateway install --system) if missing
 #   - sets Hermes config: multiplex_profiles=true, group_sessions_per_user=false
 #   - installs helpers into ~/.local/bin: restart-hermes, status-agents, status-create-account
+#   - checks .env: required keys, STATUS_DATA_DIR really holds the account,
+#     and no paths still point at another machine's home directory
 #
-# Never overwrites an existing unit or helper unless --force is given.
+# Options:
+#   --force              replace existing units/helpers that differ
+#   --fix-home OLD_HOME  after migrating: rewrite OLD_HOME → $HOME in the imported
+#                        .env / config.yaml / cron jobs / profiles (each file backed
+#                        up to <file>.bak-fixhome-<timestamp> first)
 #
 # Env overrides: STATUS_PORT (21405), HERMES_HOME (~/.hermes)
 set -euo pipefail
 
 FORCE=0
-[[ "${1:-}" == "--force" ]] && FORCE=1
-[[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+FIX_HOME=""
+while (($#)); do
+  case "$1" in
+    --force)    FORCE=1 ;;
+    --fix-home) FIX_HOME="${2:?--fix-home needs the old home path, e.g. /home/olduser}"; shift ;;
+    -h|--help)  sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown option: $1 (try --help)" >&2; exit 2 ;;
+  esac
+  shift
+done
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
@@ -52,6 +66,27 @@ install_file() {  # install_file <src> <dest> [sudo]
 }
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+
+# Files a `hermes import` carries over that may hold absolute home paths.
+path_files() {
+  ls -d "$HERMES_HOME/.env" "$HERMES_HOME/config.yaml" "$HERMES_HOME/cron/jobs.json" \
+        "$HERMES_HOME"/profiles/*/.env "$HERMES_HOME"/profiles/*/config.yaml 2>/dev/null || true
+}
+
+# ── migration: rewrite the old home path ────────────────────────────────────
+if [[ -n "$FIX_HOME" ]]; then
+  FIX_HOME="${FIX_HOME%/}"
+  [[ "$FIX_HOME" == "$HOME" ]] && die "--fix-home is the current \$HOME ($HOME); pass the OLD machine's home"
+  say "rewriting $FIX_HOME → $HOME"
+  ts="$(date +%Y%m%d-%H%M%S)"; changed=0
+  while IFS= read -r f; do
+    [[ -n "$f" ]] && grep -qF "$FIX_HOME" "$f" || continue
+    cp -p "$f" "$f.bak-fixhome-$ts"
+    OLD_HOME="$FIX_HOME" perl -pi -e 's|\Q$ENV{OLD_HOME}\E|$ENV{HOME}|g' "$f"
+    ok "fixed ${f/#$HOME/~}  (backup: .bak-fixhome-$ts)"; changed=$((changed+1))
+  done < <(path_files)
+  ((changed)) || ok "no file contained $FIX_HOME"
+fi
 
 # ── systemd: gateway drop-in ────────────────────────────────────────────────
 say "systemd units"
@@ -93,6 +128,32 @@ missing=()
 for k in STATUS_KEY_UID STATUS_PASSWORD STATUS_DATA_DIR STATUS_ALLOW_FROM STATUS_HOME_CHANNEL; do
   grep -qE "^\s*$k=." "$HERMES_HOME/.env" 2>/dev/null || missing+=("$k")
 done
+
+env_val() {  # last value of KEY in .env, quotes stripped, ~ / $HOME expanded
+  local v; v="$(grep -E "^\s*$1=" "$HERMES_HOME/.env" 2>/dev/null | tail -1 | cut -d= -f2- | sed -E "s/^[\"']//; s/[\"']\s*$//")"
+  v="${v/#\~/$HOME}"; v="${v//\$HOME/$HOME}"; v="${v//\$\{HOME\}/$HOME}"; printf '%s' "$v"
+}
+
+# Paths left over from another machine (a different /home/<user> or /Users/<user>).
+stale="$(path_files | xargs -r grep -ohE '(/home|/Users)/[^/[:space:]"'"'"':]+' 2>/dev/null \
+          | sort -u | grep -vxF "$HOME" || true)"
+if [[ -n "$stale" ]]; then
+  for old in $stale; do
+    warn "files under $HERMES_HOME still reference $old (this machine's home is $HOME)"
+    echo "    fix with: $0 --fix-home $old"
+  done
+fi
+
+data_dir="$(env_val STATUS_DATA_DIR)"; key_uid="$(env_val STATUS_KEY_UID)"
+if [[ -n "$data_dir" && -n "$key_uid" ]]; then
+  if [[ ! -d "$data_dir" ]]; then
+    warn "STATUS_DATA_DIR=$data_dir does not exist (stale path after migrating? copied the data dir?)"
+  elif ! compgen -G "$data_dir/$key_uid*" >/dev/null; then
+    warn "no files for STATUS_KEY_UID $key_uid in $data_dir — login will fail (wrong dir or key-uid?)"
+  else
+    ok "STATUS_DATA_DIR holds the account $key_uid"
+  fi
+fi
 
 echo
 if ((${#missing[@]})); then
