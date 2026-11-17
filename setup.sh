@@ -29,7 +29,7 @@ while (($#)); do
   case "$1" in
     --force)    FORCE=1 ;;
     --fix-home) FIX_HOME="${2:?--fix-home needs the old home path, e.g. /home/olduser}"; shift ;;
-    -h|--help)  sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)  sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1 (try --help)" >&2; exit 2 ;;
   esac
   shift
