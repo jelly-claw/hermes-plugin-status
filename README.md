@@ -35,7 +35,9 @@ Status app (you) ⇄ Waku network ⇄ status-backend (127.0.0.1:21405) ⇄ this 
 
 ## Requirements
 
-- Linux with systemd. It runs fine on a Raspberry Pi (arm64).
+- Linux with systemd. It runs fine on a Raspberry Pi (arm64). macOS works too: the gateway
+  runs as a launchd service and status-backend runs in Docker Desktop (see
+  [Operations](#operations)).
 - Hermes installed at `~/.hermes/hermes-agent`. Tested with Hermes v0.23.1 (`5c1abd257d`).
 - Docker with BuildKit (the default since Docker 23), for status-backend. Tested with
   status-go `v10.35.5`.
@@ -64,12 +66,14 @@ status-create-account --name Jelly --write-env ~/.hermes/.env
 #    STATUS_ALLOW_FROM=0x04…   STATUS_HOME_CHANNEL=0x04…   (see .env.example)
 
 # 6. Go
-restart-hermes
-journalctl -u hermes-gateway -f
+restart-hermes                      # macOS: hermes gateway start
+journalctl -u hermes-gateway -f     # macOS: hermes gateway status
 ```
 
 Then, in the Status app, add the bot's chat key (printed by `status-create-account`) as a
-contact and send it a message.
+contact. The bot accepts contact requests from `STATUS_ALLOW_FROM` keys by itself. The text
+you attach to the request is not passed to the agent, so send a normal message once the
+contact is added.
 
 ## Run status-backend in Docker
 
@@ -168,7 +172,7 @@ services on the old machine.
 | `STATUS_PORT` | | Backend port (default `21405`) |
 | `STATUS_PROFILE_NAME` | | Display name kept on the bot's Status profile |
 | `ASSISTANT_NAME` | | Bot name; also the typed `@Name` wake word in groups (default `Jelly`) |
-| `STATUS_ALLOW_FROM` | | Admin chat keys (`0x04…`). DMs only from these; groups only if one is a member |
+| `STATUS_ALLOW_FROM` | | Admin chat keys (`0x04…`). DMs only from these; groups only if one is a member. Their contact requests are accepted automatically |
 | `STATUS_HOME_CHANNEL` | | Default target for cron / `send_message` (usually your 1:1 chat key) |
 | `STATUS_ALLOW_ALL_USERS` | | `true` lets all members of an admitted group address its agent |
 | `STATUS_CRON_PROFILE_SHIMS` | | `always` / `never` to override when the per-group cron shims install |
@@ -207,6 +211,14 @@ sync.
 - **Don't restart `status-backend` casually.** A restart drops the Waku connections and
   resets group-chat syncing. Reconnecting and catching up takes a while. Restarting only the
   gateway is always safe, because the plugin reuses the backend's existing login.
+- **The backend forgets its login when it restarts.** The plugin notices on its next poll
+  (`status-backend lost the login session` in the log) and hands itself to the gateway's
+  reconnect watcher, which logs in again once the backend answers. Messages that arrived
+  while it was down are skipped, as after a gateway restart.
+- **macOS:** `restart-hermes` and `journalctl` are Linux-only. Use `hermes gateway restart`
+  and `hermes gateway status`; logs are in `~/.hermes/logs/gateway.log`. Turn on Docker
+  Desktop's "Start Docker Desktop when you sign in", because the container's restart policy
+  only applies while Docker itself runs.
 - **Health probes**: POST to `http://127.0.0.1:21405/statusgo/CallRPC` with
   `{"jsonrpc":"2.0","id":1,"method":"wakuext_peers","params":[]}`. A non-empty `result`
   means the transport is up. `wakuext_activeChats` works even while the transport is down,
@@ -233,14 +245,16 @@ Never patch the Hermes core tree for Status behaviour. Put it in this plugin, us
 
 ## Tests
 
-No pytest is needed. Run the tests with the Hermes venv python, from the installed plugin
+No pytest is needed. Run the tests with Hermes's own python, from the installed plugin
 directory. They import the plugin as the `status` package:
 
 ```bash
 cd ~/.hermes/plugins/status
 PY=~/.hermes/hermes-agent/venv/bin/python
+# installs without a venv (managed Python behind a launcher):
+# PY=$(~/.hermes/hermes-agent/.hermes/bin/hermes --print-runtime-command | sed -E 's/^\["([^"]+)".*/\1/')
 $PY -c 'import importlib.util as u,sys
-for f in ["test_send_targets.py","test_profile_routes.py"]:
+for f in ["test_send_targets.py","test_profile_routes.py","test_session_recovery.py"]:
     s=u.spec_from_file_location(f[:-3],f); m=u.module_from_spec(s); s.loader.exec_module(m)
     for n,fn in vars(m).items():
         if n.startswith("test_"): fn(); print("PASS",n)'
