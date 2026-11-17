@@ -220,7 +220,10 @@ class StatusAdapter(BasePlatformAdapter):
         self.port = int(os.getenv("STATUS_PORT", extra.get("port", "21405")))
         self.key_uid = os.getenv("STATUS_KEY_UID", extra.get("key_uid", ""))
         self.password = os.getenv("STATUS_PASSWORD", extra.get("password", ""))
-        self.data_dir = os.getenv("STATUS_DATA_DIR", extra.get("data_dir", ""))
+        # Expand ~ / $HOME so a portable value survives moving to a machine
+        # with a different home directory.
+        self.data_dir = os.path.expanduser(os.path.expandvars(
+            os.getenv("STATUS_DATA_DIR", extra.get("data_dir", ""))))
         self.profile_name = os.getenv("STATUS_PROFILE_NAME", extra.get("profile_name", "")).strip()
         self.assistant_name = os.getenv("ASSISTANT_NAME", "Jelly")
         # Wake-word fallback for group chats: a typed "@Jelly" (no structural
@@ -288,8 +291,20 @@ class StatusAdapter(BasePlatformAdapter):
         else:
             reuse = False
             try:
-                await initialize_application(self._client, self.port, self.data_dir)
+                init = await initialize_application(self._client, self.port, self.data_dir)
                 logger.info("Status: application initialized")
+                # InitializeApplication lists the accounts found in dataDir.
+                # If ours isn't there, LoginAccount fails with an opaque error;
+                # the usual cause is a stale path (e.g. the old machine's home
+                # directory after migrating), so say that plainly.
+                if isinstance(init, dict) and isinstance(init.get("accounts"), list) \
+                        and not any(a.get("key-uid") == self.key_uid for a in init["accounts"]):
+                    raise RuntimeError(
+                        f"account {self.key_uid[:20]}… not found in STATUS_DATA_DIR={self.data_dir!r} "
+                        f"({len(init['accounts'])} account(s) there). Check the path — after "
+                        "migrating, it may still point at the old machine's home directory "
+                        "(see README, 'Migrating an existing agent')."
+                    )
                 await login_account(self._client, self.port, self.key_uid, self.password)
                 logger.info("Status: logged in (key_uid=%s…)", self.key_uid[:20])
             except Exception as e:
