@@ -87,20 +87,27 @@ docker build -t status-backend:$STATUS_GO \
 # Run (starts on boot and restarts on crash; no systemd unit needed)
 mkdir -p ~/.status-backend/data
 docker run -d --name status-backend --restart unless-stopped \
-  --network host \
+  -p 127.0.0.1:21405:21405 \
   --user "$(id -u):$(id -g)" -e HOME=/usr/status-user \
   -e GOMEMLIMIT=700MiB \
   -v "$HOME/.status-backend:$HOME/.status-backend" \
   status-backend:$STATUS_GO \
-  status-backend --address 127.0.0.1:21405
+  status-backend --address 0.0.0.0:21405
 
 curl -s localhost:21405/health               # → {"version":"v10.35.5"}
 ```
 
 What the flags are for:
-- **`--network host` with `--address 127.0.0.1:21405`** keeps the API reachable only from
-  this machine. That matters because the API has **no authentication**: anyone who can reach
-  it can act as the bot. Never publish it with `-p 21405:21405` or bind it to `0.0.0.0`.
+- **`-p 127.0.0.1:21405:21405`** publishes the API on this machine's localhost only. That
+  matters because the API has **no authentication**: anyone who can reach it can act as the
+  bot. Never shorten it to `-p 21405:21405`, which exposes it to your whole network.
+  Inside the container the backend listens on `0.0.0.0`; it has to, for Docker to forward
+  the port.
+- **No `--network host`:** on Docker Desktop (macOS, Windows, or Linux), "host" means
+  Docker's internal VM, so the API would be unreachable from your machine. Waku only makes
+  outgoing connections, which work fine on Docker's default network.
+- **`$STATUS_GO` must be set in the shell where you run this.** If it's empty you get
+  `invalid reference format`. Check the tag with `docker images status-backend`.
 - **The data folder is mounted at the same path inside and outside the container,** so
   `STATUS_DATA_DIR=$HOME/.status-backend/data` is valid for both the backend and the plugin.
 - **`--user`** keeps the files owned by you rather than root.
