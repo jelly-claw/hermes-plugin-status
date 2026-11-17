@@ -1,0 +1,28 @@
+name: status
+label: Status
+kind: platform
+version: 1.0.0
+description: >
+  Status messenger platform adapter for Hermes — decentralized, E2E-encrypted
+  messaging over Waku/Ethereum via a local status-backend (HTTP/RPC on
+  127.0.0.1:21405). Ported from NanoClaw. Installed in the user plugins dir so
+  it survives Hermes upgrades (which rewrite the bundled plugins tree).
+author: local
+requires_env:
+  - name: STATUS_KEY_UID
+    description: "Status account key UID (0x…) from status-backend / Status desktop"
+  - name: STATUS_PASSWORD
+    description: "Status account password"
+  - name: STATUS_DATA_DIR
+    description: "status-backend data directory path"
+optional_env:
+  - name: STATUS_PORT
+    description: "status-backend HTTP port (default: 21405)"
+  - name: STATUS_PROFILE_NAME
+    description: "Display name to maintain on the Status profile"
+  - name: STATUS_ALLOW_FROM
+    description: "Space/comma-separated admin public keys (0x04…); gates DMs/groups"
+  - name: STATUS_HOME_CHANNEL
+    description: "Default chat id for cron / proactive (send_message) delivery"
+  - name: ASSISTANT_NAME
+    description: "Bot name prepended to outbound messages (default: Jelly)"

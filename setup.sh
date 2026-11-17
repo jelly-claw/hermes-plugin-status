@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# setup.sh — wire the Hermes Status plugin into a machine (idempotent).
+#
+# Run as your normal user (uses sudo for systemd), AFTER:
+#   1. Hermes is installed (~/.hermes/hermes-agent)
+#   2. status-backend + libsds are built and installed (README, "Build status-backend")
+#   3. the plugin is installed: hermes plugins install jelly-claw/hermes-plugin-status --enable
+#
+# What it does:
+#   - installs status-backend.service (+ memory drop-in) if not present
+#   - installs a drop-in so hermes-gateway.service waits for status-backend
+#   - installs the gateway service (hermes gateway install --system) if missing
+#   - sets Hermes config: multiplex_profiles=true, group_sessions_per_user=false
+#   - installs helpers into ~/.local/bin: restart-hermes, status-agents, status-create-account
+#
+# Never overwrites an existing unit or helper unless --force is given.
+#
+# Env overrides: STATUS_PORT (21405), STATUS_LIBDIR (/usr/local/lib/status-go),
+#                HERMES_HOME (~/.hermes)
+set -euo pipefail
+
+FORCE=0
+[[ "${1:-}" == "--force" ]] && FORCE=1
+[[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+HERMES_PY="$HERMES_HOME/hermes-agent/venv/bin/python"
+PORT="${STATUS_PORT:-21405}"
+LIBDIR="${STATUS_LIBDIR:-/usr/local/lib/status-go}"
+BIN_DIR="$HOME/.local/bin"
+UNIT_DIR=/etc/systemd/system
+
+say()  { printf '\033[36m▸ %s\033[0m\n' "$*"; }
+ok()   { printf '\033[32m✓ %s\033[0m\n' "$*"; }
+warn() { printf '\033[33m! %s\033[0m\n' "$*"; }
+die()  { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
+
+hermes() { "$HERMES_PY" -m hermes_cli.main "$@"; }
+
+# ── prerequisites ───────────────────────────────────────────────────────────
+[[ -x "$HERMES_PY" ]] || die "Hermes not found at $HERMES_HOME/hermes-agent — install Hermes first"
+[[ -x /usr/local/bin/status-backend ]] || die "/usr/local/bin/status-backend missing — build it (README, 'Build status-backend')"
+[[ -f "$LIBDIR/libsds.so" ]] || warn "$LIBDIR/libsds.so not found — status-backend needs it (set STATUS_LIBDIR if it lives elsewhere)"
+[[ -d "$HERMES_HOME/plugins/status" ]] || warn "plugin not at $HERMES_HOME/plugins/status — run: hermes plugins install jelly-claw/hermes-plugin-status --enable"
+
+install_file() {  # install_file <src> <dest> [sudo]
+  local src="$1" dest="$2" sudo="${3:-}"
+  if [[ -e "$dest" && "$FORCE" -eq 0 ]]; then
+    if ${sudo:+sudo} cmp -s "$src" "$dest"; then ok "$dest up to date"; else warn "$dest exists and differs — kept (use --force to replace)"; fi
+    return
+  fi
+  ${sudo:+sudo} install -D -m "${MODE:-0644}" "$src" "$dest"
+  ok "installed $dest"
+}
+
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+
+# ── systemd: status-backend ─────────────────────────────────────────────────
+say "systemd units"
+sed -e "s|@USER@|$USER|" -e "s|@HOME@|$HOME|" -e "s|@PORT@|$PORT|" -e "s|@LIBDIR@|$LIBDIR|" \
+  "$HERE/systemd/status-backend.service" > "$TMP/status-backend.service"
+install_file "$TMP/status-backend.service" "$UNIT_DIR/status-backend.service" sudo
+install_file "$HERE/systemd/status-backend.service.d/10-memory.conf" \
+  "$UNIT_DIR/status-backend.service.d/10-memory.conf" sudo
+install_file "$HERE/systemd/hermes-gateway.service.d/10-status-backend.conf" \
+  "$UNIT_DIR/hermes-gateway.service.d/10-status-backend.conf" sudo
+
+# ── systemd: Hermes gateway ─────────────────────────────────────────────────
+if [[ -f "$UNIT_DIR/hermes-gateway.service" ]]; then
+  ok "hermes-gateway.service already installed"
+else
+  say "installing hermes-gateway.service (system-level, runs as $USER)"
+  sudo "$HERMES_PY" -m hermes_cli.main gateway install --system --run-as-user "$USER"
+fi
+sudo systemctl daemon-reload
+sudo systemctl enable status-backend.service hermes-gateway.service >/dev/null 2>&1 || true
+ok "units enabled"
+
+# ── Hermes config ───────────────────────────────────────────────────────────
+say "Hermes config"
+[[ "$(hermes config get multiplex_profiles 2>/dev/null)" == "true" ]] \
+  || hermes config set --force multiplex_profiles true
+[[ "$(hermes config get group_sessions_per_user 2>/dev/null)" == "false" ]] \
+  || hermes config set group_sessions_per_user false
+hermes config get plugins.enabled 2>/dev/null | grep -qx '\s*- status' \
+  || hermes plugins enable status || warn "could not enable plugin 'status' — is it installed?"
+ok "multiplex_profiles=true, group_sessions_per_user=false, plugin enabled"
+
+# ── helpers ─────────────────────────────────────────────────────────────────
+say "helpers → $BIN_DIR"
+MODE=0755 install_file "$HERE/bin/restart-hermes" "$BIN_DIR/restart-hermes"
+MODE=0755 install_file "$HERE/bin/status-create-account" "$BIN_DIR/status-create-account"
+# status-agents imports Hermes modules, so it runs on the Hermes venv python.
+sed "1s|.*|#!$HERMES_PY|" "$HERE/bin/status-agents" > "$TMP/status-agents"
+MODE=0755 install_file "$TMP/status-agents" "$BIN_DIR/status-agents"
+
+# ── .env check ──────────────────────────────────────────────────────────────
+say "checking $HERMES_HOME/.env"
+missing=()
+for k in STATUS_KEY_UID STATUS_PASSWORD STATUS_DATA_DIR STATUS_ALLOW_FROM STATUS_HOME_CHANNEL; do
+  grep -qE "^\s*$k=." "$HERMES_HOME/.env" 2>/dev/null || missing+=("$k")
+done
+
+echo
+if ((${#missing[@]})); then
+  warn "missing in .env: ${missing[*]}"
+  cat <<EOF
+
+Next steps:
+  1. sudo systemctl start status-backend
+  2. New bot account:   status-create-account --name Jelly --write-env $HERMES_HOME/.env
+     (migrating instead? copy the old data dir + STATUS_* lines — see README)
+  3. Add STATUS_ALLOW_FROM / STATUS_HOME_CHANNEL (your chat key) — see .env.example
+  4. restart-hermes   then   journalctl -u hermes-gateway -f
+EOF
+else
+  ok ".env has all required STATUS_* keys"
+  echo "Start/restart with: restart-hermes   (logs: journalctl -u hermes-gateway -f)"
+fi

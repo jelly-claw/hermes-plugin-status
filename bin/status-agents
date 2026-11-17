@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""status-agents — manage per-group-chat agents (Hermes + Status).
+
+Each Status group chat is served by its own Hermes profile (own SOUL.md
+persona + own memories/), auto-created on the group's first @-mention.
+Mapping lives in ~/.hermes/status_agents.json (edits apply live, no restart).
+
+Usage:
+  status-agents list                     Show group chats and their agents
+  status-agents create <profile> <chat>  Create/assign a custom-named agent
+  status-agents optout <chat>            Pin a group back to the main agent
+  status-agents optin <chat>             Give a pinned group its own agent again
+  status-agents soul <chat>              Print the agent's SOUL.md path
+  status-agents routes                   Mirror the mapping into config.yaml profile_routes
+
+The gateway only admits a group onto its agent profile when config.yaml's
+profile_routes (default profile) route that chat there — create/optout/optin
+keep the routes in step; `routes` re-syncs every mapping (then restart-hermes,
+or the gateway hot-adds a route on the group's next message).
+
+<chat> is a chat id or a case-insensitive substring of the group name.
+"""
+
+import importlib.util
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+HERMES_HOME = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")).expanduser()
+HERMES_AGENT = HERMES_HOME / "hermes-agent"
+PLUGIN_DIR = HERMES_HOME / "plugins" / "status"
+sys.path.insert(0, str(HERMES_AGENT))
+
+import httpx  # noqa: E402  (from the hermes venv)
+
+
+def _load_group_agents():
+    spec = importlib.util.spec_from_file_location(
+        "group_agents", PLUGIN_DIR / "group_agents.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+ga = _load_group_agents()
+
+
+def _status_port() -> int:
+    port = os.getenv("STATUS_PORT", "").strip()
+    if not port:
+        env_file = HERMES_HOME / ".env"
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                m = re.match(r"^\s*STATUS_PORT\s*=\s*(\d+)", line)
+                if m:
+                    port = m.group(1)
+                    break
+    return int(port or "21405")
+
+
+def _rpc(method: str, params=None):
+    body = {"jsonrpc": "2.0", "method": method, "params": params or [], "id": 1}
+    resp = httpx.post(
+        f"http://127.0.0.1:{_status_port()}/statusgo/CallRPC",
+        json=body,
+        timeout=15.0,
+    )
+    resp.raise_for_status()
+    outer = json.loads(resp.text)
+    data = json.loads(outer) if isinstance(outer, str) else outer
+    if isinstance(data, dict) and data.get("error"):
+        raise RuntimeError(f"RPC {method}: {data['error']}")
+    return data.get("result") if isinstance(data, dict) else None
+
+
+def _group_chats():
+    try:
+        chats = _rpc("wakuext_activeChats") or []
+    except Exception as e:
+        print(f"warning: cannot reach status-backend ({e}); using mapping file only", file=sys.stderr)
+        chats = []
+    live = [c for c in chats if isinstance(c, dict) and c.get("chatType", 1) != 1]
+    # Merge in mapped chats the backend didn't list (inactive/left groups).
+    known = {c.get("id") for c in live}
+    for cid, entry in (ga.load_map().get("chats") or {}).items():
+        if cid not in known and isinstance(entry, dict):
+            live.append({"id": cid, "name": entry.get("name") or cid[:20], "chatType": 3, "_mapped_only": True})
+    return live
+
+
+def _resolve_chat(ref: str):
+    chats = _group_chats()
+    for c in chats:
+        if c.get("id") == ref:
+            return c
+    matches = [c for c in chats if ref.lower() in (c.get("name") or "").lower()]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        sys.exit(f"error: no group chat matches {ref!r} (try `status-agents list`)")
+    names = "\n  ".join(f"{c.get('name')}  ({c.get('id')[:24]}…)" for c in matches)
+    sys.exit(f"error: {ref!r} is ambiguous:\n  {names}")
+
+
+def _profile_state(profile):
+    if profile is None:
+        return "the main agent", None
+    pdir = ga._profile_dir(profile)
+    if pdir and pdir.is_dir():
+        return "ready", pdir
+    return "pending (created on first @-mention)", pdir
+
+
+def cmd_list():
+    chats = _group_chats()
+    if not chats:
+        print("no group chats found")
+        return
+    rows = []
+    for c in sorted(chats, key=lambda x: (x.get("name") or "").lower()):
+        cid = c.get("id", "")
+        name = c.get("name") or cid[:20]
+        profile = ga.resolve_profile_name(cid, name, True, record=False)
+        state, pdir = _profile_state(profile)
+        rows.append((name, profile or "default", state, cid))
+    w1 = max(len(r[0]) for r in rows) + 2
+    w2 = max(len(r[1]) for r in rows) + 2
+    w3 = max(len(r[2]) for r in rows) + 2
+    print(f"{'GROUP':<{w1}}{'AGENT PROFILE':<{w2}}{'STATE':<{w3}}CHAT ID")
+    for name, profile, state, cid in rows:
+        print(f"{name:<{w1}}{profile:<{w2}}{state:<{w3}}{cid[:28]}…")
+    print(f"\nmapping file: {ga._map_path()}")
+    print(f"profiles dir: {ga._default_home() / 'profiles'}")
+
+
+def cmd_create(profile: str, ref: str):
+    from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+    profile = normalize_profile_name(profile)
+    validate_profile_name(profile)
+    if profile == "default":
+        sys.exit("error: use `status-agents optout <chat>` to assign the main agent")
+    chat = _resolve_chat(ref)
+    cid, name = chat["id"], chat.get("name") or chat["id"][:20]
+    pdir = ga.ensure_profile_dir(profile, name)
+    if pdir is None:
+        sys.exit("error: profile creation failed (see logs)")
+    ga.record_mapping(cid, profile, name)
+    print(f"group {name!r} → agent profile {profile!r}")
+    print(f"persona file: {pdir / 'SOUL.md'}")
+    _sync_route(cid, profile)
+
+
+def cmd_optout(ref: str):
+    chat = _resolve_chat(ref)
+    cid, name = chat["id"], chat.get("name") or chat["id"][:20]
+    ga.record_mapping(cid, "default", name)
+    print(f"group {name!r} now served by the main agent")
+    _sync_route(cid, None)
+
+
+def cmd_optin(ref: str):
+    chat = _resolve_chat(ref)
+    cid, name = chat["id"], chat.get("name") or chat["id"][:20]
+    data = ga.load_map()
+    chats = dict(data.get("chats") or {})
+    chats.pop(cid, None)
+    data = dict(data)
+    data["chats"] = chats
+    ga.save_map(data)
+    profile = ga.resolve_profile_name(cid, name, True)
+    print(f"group {name!r} → agent profile {profile!r} (dir created on first @-mention)")
+    _sync_route(cid, profile)
+
+
+def _sync_route(cid: str, profile):
+    """Mirror one mapping into config.yaml profile_routes (see group_agents)."""
+    try:
+        done = ga.ensure_persisted_route(cid, profile)
+    except Exception as e:  # noqa: BLE001
+        print(f"warning: could not update config.yaml profile_routes: {e}", file=sys.stderr)
+        return
+    if done:
+        print(f"config.yaml profile_routes: {cid[:20]}… → {profile or 'default'}")
+    else:
+        print(f"config.yaml profile_routes: route for {profile!r} added on first @-mention "
+              "(profile dir not created yet)")
+
+
+def cmd_routes():
+    """Re-sync every mapping into config.yaml profile_routes (one write) and report the state."""
+    data = ga.load_map()
+    chats = {cid: e for cid, e in (data.get("chats") or {}).items() if isinstance(e, dict)}
+    if not chats:
+        print("no mapped group chats")
+        return
+    wanted = {}
+    for cid, entry in chats.items():
+        prof = str(entry.get("profile") or "").strip()
+        wanted[cid] = None if prof in ("", "default") else prof
+    before = {cid: ga.persisted_route_profile(cid) for cid in chats}
+    try:
+        done = ga.sync_persisted_routes(wanted)
+    except Exception as e:  # noqa: BLE001
+        sys.exit(f"error: could not update config.yaml profile_routes: {e}")
+    changed = 0
+    for cid, entry in chats.items():
+        after = ga.persisted_route_profile(cid)
+        state = "ok" if done.get(cid) else "pending (profile dir missing)"
+        if before[cid] != after:
+            changed += 1
+            state = f"updated ({before[cid] or 'default'} → {after or 'default'})"
+        print(f"{(entry.get('name') or cid[:20]):<36} {wanted[cid] or 'default':<30} {state}")
+    print(f"\n{changed} route(s) changed in {ga._default_home() / 'config.yaml'}")
+    if changed:
+        print("the running gateway hot-adds a route on the group's next message; restart-hermes applies all now")
+
+
+def cmd_soul(ref: str):
+    chat = _resolve_chat(ref)
+    cid, name = chat["id"], chat.get("name") or chat["id"][:20]
+    profile = ga.resolve_profile_name(cid, name, True, record=False)
+    if profile is None:
+        print(f"group {name!r} is served by the main agent: {ga._default_home() / 'SOUL.md'}")
+        return
+    state, pdir = _profile_state(profile)
+    soul = pdir / "SOUL.md"
+    print(soul)
+    if state != "ready":
+        print(f"(profile {profile!r} not created yet — {state})", file=sys.stderr)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in {"-h", "--help", "help"}:
+        print(__doc__.strip())
+        return
+    cmd, rest = args[0], args[1:]
+    if cmd == "list" and not rest:
+        cmd_list()
+    elif cmd == "routes" and not rest:
+        cmd_routes()
+    elif cmd == "create" and len(rest) == 2:
+        cmd_create(rest[0], rest[1])
+    elif cmd in {"optout", "optin", "soul"} and len(rest) == 1:
+        {"optout": cmd_optout, "optin": cmd_optin, "soul": cmd_soul}[cmd](rest[0])
+    else:
+        sys.exit(f"error: bad usage — run `status-agents help`")
+
+
+if __name__ == "__main__":
+    main()

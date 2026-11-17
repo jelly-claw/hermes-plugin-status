@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""status-create-account — create a fresh Status account on a local status-backend.
+
+One-time step for a NEW bot identity. If you are moving an existing agent to a new
+machine, don't run this: copy the status-backend data dir and the STATUS_* lines
+from the old ~/.hermes/.env instead (see README, "Migrating an existing agent").
+
+Follows status-go's documented "Create account and login" flow
+(cmd/status-backend/README.md in status-im/status-go):
+  InitializeApplication -> CreateAccountAndLogin -> (wait for login)
+  -> wakuext_startMessenger -> settings_getSettings
+
+Standard library only. Usage:
+  status-create-account [--name Jelly] [--data-dir DIR] [--port 21405]
+                        [--write-env ~/.hermes/.env] [--force]
+
+The password comes from $STATUS_PASSWORD, or is prompted for (twice).
+"""
+
+import argparse
+import getpass
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+
+def post(port, path, body, timeout=60):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read().decode() or "null"
+    return json.loads(raw)
+
+
+def rpc(port, method, params=None, timeout=60):
+    """CallRPC; returns result or raises RuntimeError with the RPC error."""
+    resp = post(port, "/statusgo/CallRPC",
+                {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []},
+                timeout=timeout)
+    if isinstance(resp, dict) and resp.get("error"):
+        raise RuntimeError(f"{method}: {resp['error']}")
+    return resp.get("result") if isinstance(resp, dict) else resp
+
+
+def call_error(resp):
+    """statusgo/* endpoints answer {"error": ""} on success."""
+    if isinstance(resp, dict) and resp.get("error"):
+        return resp["error"]
+    return None
+
+
+def logged_in_settings(port):
+    try:
+        s = rpc(port, "settings_getSettings", timeout=10)
+        return s if isinstance(s, dict) and s.get("key-uid") else None
+    except Exception:
+        return None
+
+
+def write_env(path, values):
+    path = Path(path).expanduser()
+    lines = path.read_text().splitlines() if path.exists() else []
+    for key, val in values.items():
+        pat = re.compile(rf"^\s*{re.escape(key)}\s*=")
+        new = f"{key}={val}"
+        for i, line in enumerate(lines):
+            if pat.match(line):
+                lines[i] = new
+                break
+        else:
+            lines.append(new)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n")
+    path.chmod(0o600)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--name", default=os.getenv("STATUS_PROFILE_NAME") or "Jelly",
+                    help="display name of the new account (default: $STATUS_PROFILE_NAME or Jelly)")
+    ap.add_argument("--data-dir", default=os.getenv("STATUS_DATA_DIR") or "~/.status-backend/data",
+                    help="status-backend data dir (default: $STATUS_DATA_DIR or ~/.status-backend/data)")
+    ap.add_argument("--port", type=int, default=int(os.getenv("STATUS_PORT") or 21405))
+    ap.add_argument("--write-env", metavar="FILE",
+                    help="write STATUS_* settings into this .env (e.g. ~/.hermes/.env)")
+    ap.add_argument("--force", action="store_true",
+                    help="create another account even if the data dir already has one")
+    a = ap.parse_args()
+    data_dir = str(Path(a.data_dir).expanduser())
+
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{a.port}/health", timeout=5).read()
+    except Exception as e:
+        sys.exit(f"status-backend is not reachable on 127.0.0.1:{a.port} ({e}). "
+                 "Start it first: sudo systemctl start status-backend")
+
+    # A backend that is already logged in must not be re-initialized: running
+    # InitializeApplication/LoginAccount on a live session wedges it.
+    s = logged_in_settings(a.port)
+    if s:
+        sys.exit(f"status-backend is already logged in as {s.get('display-name')!r} "
+                 f"(key-uid {s.get('key-uid')}). Nothing to do.\n"
+                 "To create a different account, stop the gateway, restart status-backend, and rerun.")
+
+    Path(data_dir).mkdir(parents=True, exist_ok=True)
+    init = post(a.port, "/statusgo/InitializeApplication", {"dataDir": data_dir})
+    if call_error(init):
+        sys.exit(f"InitializeApplication failed: {call_error(init)}")
+    existing = (init or {}).get("accounts") or []
+    if existing and not a.force:
+        print("This data dir already holds account(s):")
+        for acc in existing:
+            print(f"  {acc.get('name')!r:24} key-uid {acc.get('key-uid')}")
+        sys.exit("Use one of these as STATUS_KEY_UID, or pass --force to create another.")
+
+    password = os.getenv("STATUS_PASSWORD")
+    if not password:
+        password = getpass.getpass("New Status account password: ")
+        if password != getpass.getpass("Repeat password: "):
+            sys.exit("passwords do not match")
+    if not password:
+        sys.exit("empty password")
+
+    print(f"Creating Status account {a.name!r} in {data_dir} …")
+    resp = post(a.port, "/statusgo/CreateAccountAndLogin", {
+        "rootDataDir": data_dir,
+        "displayName": a.name,
+        "password": password,
+        "customizationColor": "blue",
+    }, timeout=120)
+    if call_error(resp):
+        sys.exit(f"CreateAccountAndLogin failed: {call_error(resp)}")
+
+    # Account creation + login run asynchronously in the backend (it signals
+    # node.login on /signals). Poll settings instead of needing a websocket.
+    deadline = time.time() + 180
+    while not (s := logged_in_settings(a.port)):
+        if time.time() > deadline:
+            sys.exit("timed out waiting for login; check: journalctl -u status-backend")
+        time.sleep(2)
+
+    for _ in range(30):  # start the Waku transport (required to receive)
+        try:
+            rpc(a.port, "wakuext_startMessenger", timeout=120)
+            break
+        except Exception as e:
+            if "already" in str(e).lower():
+                break
+            time.sleep(4)
+    s = logged_in_settings(a.port) or s
+
+    key_uid, pubkey = s.get("key-uid"), s.get("public-key")
+    print("\n✓ Account created and logged in")
+    print(f"  display name : {s.get('display-name')}")
+    print(f"  key-uid      : {key_uid}")
+    print(f"  chat key     : {pubkey}   <- add this contact in the Status app")
+
+    values = {
+        "STATUS_KEY_UID": key_uid,
+        "STATUS_PASSWORD": password,
+        "STATUS_DATA_DIR": data_dir,
+        "STATUS_PORT": str(a.port),
+        "STATUS_PROFILE_NAME": a.name,
+    }
+    if a.write_env:
+        write_env(a.write_env, values)
+        print(f"\nWrote STATUS_KEY_UID/PASSWORD/DATA_DIR/PORT/PROFILE_NAME to {a.write_env} (mode 600).")
+    else:
+        print("\nAdd to ~/.hermes/.env:")
+        for k, v in values.items():
+            print(f"  {k}={'<the password you chose>' if k == 'STATUS_PASSWORD' else v}")
+    print("Then set STATUS_ALLOW_FROM / STATUS_HOME_CHANNEL to YOUR Status chat key (0x04…).")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except urllib.error.URLError as e:
+        sys.exit(f"request to status-backend failed: {e}")
