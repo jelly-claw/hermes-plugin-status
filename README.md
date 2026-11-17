@@ -12,8 +12,9 @@ Status app (you) ⇄ Waku network ⇄ status-backend (127.0.0.1:21405) ⇄ this 
 ```
 
 - **status-backend** is status-go's HTTP/RPC server. It does the encryption and networking.
-  Build it from [status-im/status-go](https://github.com/status-im/status-go). It is
-  **not** shipped here, because Status updates it on its own schedule.
+  Run it in Docker, built straight from
+  [status-im/status-go](https://github.com/status-im/status-go). It is **not** shipped here,
+  because Status updates it on its own schedule.
 - **The plugin** logs into the backend, checks for new messages every 15 seconds and turns
   them into Hermes messages. Replies go back through the backend's send calls.
 
@@ -36,12 +37,13 @@ Status app (you) ⇄ Waku network ⇄ status-backend (127.0.0.1:21405) ⇄ this 
 
 - Linux with systemd. It runs fine on a Raspberry Pi (arm64).
 - Hermes installed at `~/.hermes/hermes-agent`. Tested with Hermes v0.23.1 (`5c1abd257d`).
-- `status-backend` and `libsds.so` built from status-go. Tested with status-go `v10.35.5`.
+- Docker with BuildKit (the default since Docker 23), for status-backend. Tested with
+  status-go `v10.35.5`.
 
 ## New machine: quick start
 
 ```bash
-# 1. Build + install status-backend (see next section)
+# 1. Build and start status-backend in Docker (see next section)
 
 # 2. Install the plugin. It lands in ~/.hermes/plugins/status, which Hermes upgrades leave alone.
 hermes plugins install jelly-claw/hermes-plugin-status --enable
@@ -54,8 +56,7 @@ hermes plugins install jelly-claw/hermes-plugin-status --enable
 # 3. Wire up systemd, Hermes config and the helper scripts
 ~/.hermes/plugins/status/setup.sh
 
-# 4. Start the backend, then EITHER create a new bot account …
-sudo systemctl start status-backend
+# 4. EITHER create a new bot account …
 status-create-account --name Jelly --write-env ~/.hermes/.env
 #    … OR migrate an existing agent (see "Migrating an existing agent")
 
@@ -70,27 +71,46 @@ journalctl -u hermes-gateway -f
 Then, in the Status app, add the bot's chat key (printed by `status-create-account`) as a
 contact and send it a message.
 
-## Build status-backend
+## Run status-backend in Docker
 
-Follow status-go's own build docs; they are the source of truth. The outline:
+status-go ships its own `Dockerfile`. Docker builds it straight from GitHub, so you don't
+need Go or Nim on the host. Pick the newest `v*` tag from
+[status-go's tags](https://github.com/status-im/status-go/tags).
 
 ```bash
-# Prereqs: Go (version per status-go's go.mod), Nim (for nim-sds), make, gcc
-git clone https://github.com/status-im/status-go.git
-cd status-go
-git checkout <latest release tag>          # e.g. v10.35.5
-make status-backend                         # also fetches + builds nim-sds (libsds) next to the repo
+# Build (one-off; takes a while, especially on a Raspberry Pi)
+STATUS_GO=v10.35.5
+docker build -t status-backend:$STATUS_GO \
+  --build-arg build_flags="-ldflags=-X=github.com/status-im/status-go/pkg/version.version=$STATUS_GO" \
+  "https://github.com/status-im/status-go.git#$STATUS_GO"
 
-sudo install -m 0755 build/bin/status-backend /usr/local/bin/status-backend
-sudo install -D -m 0755 ../nim-sds/build/libsds.so /usr/local/lib/status-go/libsds.so
+# Run (starts on boot and restarts on crash; no systemd unit needed)
+mkdir -p ~/.status-backend/data
+docker run -d --name status-backend --restart unless-stopped \
+  --network host \
+  --user "$(id -u):$(id -g)" -e HOME=/usr/status-user \
+  -e GOMEMLIMIT=700MiB \
+  -v "$HOME/.status-backend:$HOME/.status-backend" \
+  status-backend:$STATUS_GO \
+  status-backend --address 127.0.0.1:21405
+
+curl -s localhost:21405/health               # → {"version":"v10.35.5"}
 ```
 
-The unit sets `LD_LIBRARY_PATH` to `/usr/local/lib/status-go`. If you put `libsds.so`
-somewhere else, run `STATUS_LIBDIR=/that/dir ./setup.sh`. To check the build:
-`curl -s localhost:21405/health` should print `{"version":"v…"}`.
+What the flags are for:
+- **`--network host` with `--address 127.0.0.1:21405`** keeps the API reachable only from
+  this machine. That matters because the API has **no authentication**: anyone who can reach
+  it can act as the bot. Never publish it with `-p 21405:21405` or bind it to `0.0.0.0`.
+- **The data folder is mounted at the same path inside and outside the container,** so
+  `STATUS_DATA_DIR=$HOME/.status-backend/data` is valid for both the backend and the plugin.
+- **`--user`** keeps the files owned by you rather than root.
+- **`GOMEMLIMIT`** caps how far the Go heap grows. Without it, the backend once reached
+  2–3 GB over a few weeks.
 
-To upgrade status-go later: build the new tag, swap the binary and `libsds.so`, then run
-`restart-hermes --full`. Your account data in `STATUS_DATA_DIR` carries over.
+**Upgrade:** build the new tag, then
+`docker rm -f status-backend` and re-run the `docker run` line with the new tag. Your
+account data carries over. Upgrading drops the network connections, so expect a few minutes
+of catching up on messages.
 
 ## Migrating an existing agent
 
@@ -99,14 +119,15 @@ one copy at a time: two backends logged into the same account behave like two pa
 devices, and both pick up the same messages.
 
 ```bash
-# OLD machine
+# OLD machine (stop the backend however it runs there: systemd unit or Docker container)
 sudo systemctl stop hermes-gateway status-backend
 hermes backup -o ~/hermes-backup.zip              # ~/.hermes: config, .env, profiles, sessions, cron …
 tar czf ~/status-data.tgz -C ~ .status-backend    # the Status account (NOT in the Hermes backup)
 
-# NEW machine (Hermes installed, status-backend built)
+# NEW machine (Hermes installed, status-backend image built, container NOT started yet)
 hermes import ~/hermes-backup.zip
 tar xzf ~/status-data.tgz -C ~
+# now do the `docker run` from "Run status-backend in Docker"
 mv ~/.hermes/plugins/status ~/.hermes/plugins/status.from-backup   # replace the copied plugin with a tracked install
 hermes plugins install jelly-claw/hermes-plugin-status --enable
 ~/.hermes/plugins/status/setup.sh
@@ -161,6 +182,7 @@ sync.
 - **`restart-hermes`** is the restart to use day to day. It restarts `status-backend` only
   if the backend is unhealthy, then gently restarts the gateway, letting in-progress replies
   finish. `--full` force-restarts both; `--backend-only` leaves the gateway alone.
+- **Backend logs:** `docker logs --tail 100 status-backend`.
 - **Don't restart `status-backend` casually.** A restart drops the Waku connections and
   resets group-chat syncing. Reconnecting and catching up takes a while. Restarting only the
   gateway is always safe, because the plugin reuses the backend's existing login.
