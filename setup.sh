@@ -7,8 +7,9 @@
 #   3. the plugin is installed: hermes plugins install jelly-claw/hermes-plugin-status --enable
 #
 # What it does:
-#   - installs a drop-in so hermes-gateway.service starts after Docker
-#   - installs the gateway service (hermes gateway install --system) if missing
+#   - Linux: installs a drop-in so hermes-gateway.service starts after Docker, and
+#     the gateway service (hermes gateway install --system) if missing
+#   - macOS: installs the gateway as a per-user launchd service if missing
 #   - sets Hermes config: multiplex_profiles=true, group_sessions_per_user=false
 #   - installs helpers into ~/.local/bin: restart-hermes, status-agents, status-create-account
 #   - checks .env: required keys, STATUS_DATA_DIR really holds the account,
@@ -37,20 +38,35 @@ done
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-HERMES_PY="$HERMES_HOME/hermes-agent/venv/bin/python"
+HERMES_AGENT="$HERMES_HOME/hermes-agent"
 PORT="${STATUS_PORT:-21405}"
 BIN_DIR="$HOME/.local/bin"
 UNIT_DIR=/etc/systemd/system
+OS="$(uname -s)"
 
 say()  { printf '\033[36m▸ %s\033[0m\n' "$*"; }
 ok()   { printf '\033[32m✓ %s\033[0m\n' "$*"; }
 warn() { printf '\033[33m! %s\033[0m\n' "$*"; }
 die()  { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
-hermes() { "$HERMES_PY" -m hermes_cli.main "$@"; }
+# How to run Hermes. Older installs ship a venv; current ones run a managed
+# Python behind a launcher (hermes-agent/.hermes/bin/hermes), which must run
+# hermes_bootstrap before Hermes's dependencies are importable.
+HERMES_PY=""        # set only for venv installs
+HERMES_LAUNCHER=""  # set only for launcher installs
+if [[ -x "$HERMES_AGENT/venv/bin/python" ]]; then
+  HERMES_PY="$HERMES_AGENT/venv/bin/python"
+  HERMES_CMD=("$HERMES_PY" -m hermes_cli.main)
+elif [[ -x "$HERMES_AGENT/.hermes/bin/hermes" ]]; then
+  HERMES_LAUNCHER="$HERMES_AGENT/.hermes/bin/hermes"
+  HERMES_CMD=("$HERMES_LAUNCHER")
+else
+  die "Hermes not found at $HERMES_AGENT — install Hermes first"
+fi
+
+hermes() { "${HERMES_CMD[@]}" "$@"; }
 
 # ── prerequisites ───────────────────────────────────────────────────────────
-[[ -x "$HERMES_PY" ]] || die "Hermes not found at $HERMES_HOME/hermes-agent — install Hermes first"
 curl -sf "http://127.0.0.1:$PORT/health" >/dev/null \
   || warn "status-backend not answering on 127.0.0.1:$PORT — start the container (README, 'Run status-backend in Docker')"
 [[ -d "$HERMES_HOME/plugins/status" ]] || warn "plugin not at $HERMES_HOME/plugins/status — run: hermes plugins install jelly-claw/hermes-plugin-status --enable"
@@ -61,7 +77,9 @@ install_file() {  # install_file <src> <dest> [sudo]
     if ${sudo:+sudo} cmp -s "$src" "$dest"; then ok "$dest up to date"; else warn "$dest exists and differs — kept (use --force to replace)"; fi
     return
   fi
-  ${sudo:+sudo} install -D -m "${MODE:-0644}" "$src" "$dest"
+  # mkdir + install instead of GNU-only `install -D` (BSD install on macOS lacks it)
+  ${sudo:+sudo} mkdir -p "$(dirname "$dest")"
+  ${sudo:+sudo} install -m "${MODE:-0644}" "$src" "$dest"
   ok "installed $dest"
 }
 
@@ -88,6 +106,7 @@ if [[ -n "$FIX_HOME" ]]; then
   ((changed)) || ok "no file contained $FIX_HOME"
 fi
 
+if [[ "$OS" == Linux ]]; then
 # ── systemd: gateway drop-in ────────────────────────────────────────────────
 say "systemd units"
 install_file "$HERE/systemd/hermes-gateway.service.d/10-status-backend.conf" \
@@ -98,11 +117,19 @@ if [[ -f "$UNIT_DIR/hermes-gateway.service" ]]; then
   ok "hermes-gateway.service already installed"
 else
   say "installing hermes-gateway.service (system-level, runs as $USER)"
-  sudo "$HERMES_PY" -m hermes_cli.main gateway install --system --run-as-user "$USER"
+  sudo "${HERMES_CMD[@]}" gateway install --system --run-as-user "$USER"
 fi
 sudo systemctl daemon-reload
 sudo systemctl enable hermes-gateway.service >/dev/null 2>&1 || true
 ok "units enabled"
+else
+# ── launchd (macOS): Hermes gateway as a per-user service ──────────────────
+# No systemd drop-in: Docker Desktop's restart policy brings the container
+# back, and the adapter reconnects (logging in again) once it answers.
+say "launchd service"
+hermes gateway install --if-missing --start-on-login --no-start-now
+ok "gateway service installed (start with: hermes gateway start)"
+fi
 
 # ── Hermes config ───────────────────────────────────────────────────────────
 say "Hermes config"
@@ -118,8 +145,31 @@ ok "multiplex_profiles=true, group_sessions_per_user=false, plugin enabled"
 say "helpers → $BIN_DIR"
 MODE=0755 install_file "$HERE/bin/restart-hermes" "$BIN_DIR/restart-hermes"
 MODE=0755 install_file "$HERE/bin/status-create-account" "$BIN_DIR/status-create-account"
-# status-agents imports Hermes modules, so it runs on the Hermes venv python.
-sed "1s|.*|#!$HERMES_PY|" "$HERE/bin/status-agents" > "$TMP/status-agents"
+# status-agents imports Hermes modules, so it must run on Hermes's own Python.
+if [[ -n "$HERMES_PY" ]]; then
+  sed "1s|.*|#!$HERMES_PY|" "$HERE/bin/status-agents" > "$TMP/status-agents"
+else
+  # Managed-Python install: a shebang can't run hermes_bootstrap, so install a
+  # wrapper. It asks the launcher for the interpreter on every run, so a
+  # Python version bump by `hermes update` doesn't break it.
+  cat > "$TMP/status-agents" <<EOF
+#!/bin/sh
+# Generated by hermes-plugin-status setup.sh — runs bin/status-agents under
+# Hermes's managed Python after hermes_bootstrap (which provides httpx etc.).
+L='$HERMES_LAUNCHER'; ROOT='$HERMES_AGENT'; S='$HERE/bin/status-agents'
+PY="\$("\$L" --print-runtime-command | sed -E 's/^\\["([^"]+)".*/\\1/')"
+[ -x "\$PY" ] || { echo "status-agents: cannot resolve Hermes Python via \$L" >&2; exit 1; }
+exec "\$PY" -I -c '
+import os, sys, runpy
+for k in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV"): os.environ.pop(k, None)
+root = sys.argv.pop(1); sys.argv = sys.argv[1:]
+sys.path.insert(0, root); sys._hermes_pin_default_home = True
+import hermes_bootstrap
+os.environ.get("HERMES_HOME") or os.environ.__setitem__("HERMES_HOME", str(__import__("hermes_constants").get_default_hermes_root()))
+runpy.run_path(sys.argv[0], run_name="__main__")
+' "\$ROOT" "\$S" "\$@"
+EOF
+fi
 MODE=0755 install_file "$TMP/status-agents" "$BIN_DIR/status-agents"
 
 # ── .env check ──────────────────────────────────────────────────────────────
@@ -155,6 +205,12 @@ if [[ -n "$data_dir" && -n "$key_uid" ]]; then
   fi
 fi
 
+if [[ "$OS" == Linux ]]; then
+  START="restart-hermes   then   journalctl -u hermes-gateway -f"
+else
+  START="hermes gateway start   then   hermes gateway status"
+fi
+
 echo
 if ((${#missing[@]})); then
   warn "missing in .env: ${missing[*]}"
@@ -165,9 +221,9 @@ Next steps:
   2. New bot account:   status-create-account --name Jelly --write-env $HERMES_HOME/.env
      (migrating instead? copy the old data dir + STATUS_* lines — see README)
   3. Add STATUS_ALLOW_FROM / STATUS_HOME_CHANNEL (your chat key) — see .env.example
-  4. restart-hermes   then   journalctl -u hermes-gateway -f
+  4. $START
 EOF
 else
   ok ".env has all required STATUS_* keys"
-  echo "Start/restart with: restart-hermes   (logs: journalctl -u hermes-gateway -f)"
+  echo "Start with: $START"
 fi
