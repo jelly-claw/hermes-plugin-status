@@ -131,18 +131,32 @@ sudo systemctl stop hermes-gateway status-backend
 hermes backup -o ~/hermes-backup.zip              # ~/.hermes: config, .env, profiles, sessions, cron …
 tar czf ~/status-data.tgz -C ~ .status-backend    # the Status account (NOT in the Hermes backup)
 
-# NEW machine (Hermes installed, status-backend image built, container NOT started yet)
+# NEW machine (Hermes installed, status-backend image built)
 hermes import ~/hermes-backup.zip
 tar xzf ~/status-data.tgz -C ~
 # now do the `docker run` from "Run status-backend in Docker"
 mv ~/.hermes/plugins/status ~/.hermes/plugins/status.from-backup   # replace the copied plugin with a tracked install
 hermes plugins install jelly-claw/hermes-plugin-status --enable
-~/.hermes/plugins/status/setup.sh
+~/.hermes/plugins/status/setup.sh --fix-home /home/olduser        # the OLD machine's $HOME
+restart-hermes
 ```
 
-Check that `STATUS_DATA_DIR` in `~/.hermes/.env` still points to the right place (your home
-path may be different). Then run `restart-hermes`. Once it works, remove
-`status.from-backup`, and disable the services on the old machine.
+**Why `--fix-home`:** the backup keeps the old machine's absolute paths. If the new home
+directory is different (another username, or `/Users/...` on macOS), the imported files
+still point at the old one. The one that breaks Status is `STATUS_DATA_DIR`: the backend
+can't find the account there, so login fails. The old path also turns up in other `.env`
+paths (e.g. `OBSIDIAN_VAULT_PATH`), in Docker volume mounts in `config.yaml`, in each
+profile's own `.env` and `config.yaml`, and inside cron job prompts.
+
+`--fix-home` rewrites the old home to `$HOME` in all of those, and backs up each file to
+`<file>.bak-fixhome-<timestamp>` first. You can run `setup.sh` without it: it then lists
+any leftover old home paths it finds and checks that `STATUS_DATA_DIR` really holds the
+account. If the gateway can't find the account, its log says so (`account … not found in
+STATUS_DATA_DIR=…`). If the old path also appears in your own skills or `SOUL.md`, grep for
+it and fix those by hand.
+
+Once it works, remove `status.from-backup` and the `.bak-fixhome-*` files, and disable the
+services on the old machine.
 
 ## Configuration (`~/.hermes/.env`)
 
