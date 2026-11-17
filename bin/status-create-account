@@ -100,7 +100,8 @@ def main():
         urllib.request.urlopen(f"http://127.0.0.1:{a.port}/health", timeout=5).read()
     except Exception as e:
         sys.exit(f"status-backend is not reachable on 127.0.0.1:{a.port} ({e}). "
-                 "Start it first: sudo systemctl start status-backend")
+                 "Start the container first: docker start status-backend "
+                 "(or the docker run in README, 'Run status-backend in Docker')")
 
     # A backend that is already logged in must not be re-initialized: running
     # InitializeApplication/LoginAccount on a live session wedges it.
