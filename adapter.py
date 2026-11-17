@@ -417,6 +417,34 @@ class StatusAdapter(BasePlatformAdapter):
         await self._ensure_allowed_chats_active()
         await self._refresh_active_chats()
 
+    async def _check_session(self) -> None:
+        """Called when a chat refresh failed while the messenger was up.
+
+        status-backend keeps no login across its own restart (a Docker Desktop
+        quit, ``docker restart``, a crash) and sends no signal about it: every
+        wakuext_* RPC just answers -32601 from then on, so the bot goes deaf
+        until the gateway is restarted. connect() already waits for the backend
+        and logs in (reusing a live session), so hand recovery to the gateway's
+        reconnect watcher as a retryable fatal error instead of logging in again
+        here. A refresh that failed while the backend is up and still logged in
+        is transient and left alone.
+        """
+        if not self._running or not self._client:
+            return
+        if not await health_check(self._client, self.port):
+            reason = f"status-backend not answering on port {self.port}"
+        elif not await self._is_logged_in():
+            reason = "status-backend lost the login session (backend restarted?)"
+        else:
+            return
+        if getattr(self, "_fatal_error_handler", None) is None:
+            # Core without the fatal-error hook: nothing would reconnect us.
+            logger.warning("Status: %s — restart the gateway to log in again", reason)
+            return
+        logger.warning("Status: %s — handing to the gateway to reconnect", reason)
+        self._set_fatal_error("status_session_lost", reason, retryable=True)
+        await self._notify_fatal_error()
+
     async def disconnect(self) -> None:
         self._running = False
         for task in (self._poll_task, self._ws_task, self._startup_task):
@@ -471,18 +499,22 @@ class StatusAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.debug("Status: createOneToOneChat(%s…) failed: %s", pk[:16], e)
 
-    async def _refresh_active_chats(self) -> None:
+    async def _refresh_active_chats(self) -> bool:
+        """Refresh self._active_chats; return False when neither RPC answered."""
         try:
             result = await call_rpc(self._client, self.port, "wakuext_activeChats", [])
             self._active_chats = result if isinstance(result, list) else []
             logger.debug("Status: %d active chats", len(self._active_chats))
+            return True
         except Exception:
             try:
                 result = await call_rpc(self._client, self.port, "wakuext_chats", [])
                 all_chats = result if isinstance(result, list) else []
                 self._active_chats = [c for c in all_chats if c.get("active") is not False]
+                return True
             except Exception as e:
                 logger.warning("Status: failed to refresh chats: %s", e)
+                return False
 
     # -----------------------------------------------------------------------
     # Message polling
@@ -519,7 +551,9 @@ class StatusAdapter(BasePlatformAdapter):
                 return
         self._polling = True
         try:
-            await self._refresh_active_chats()
+            if not await self._refresh_active_chats():
+                await self._check_session()
+                return
             for chat in list(self._active_chats):
                 await self._process_chat(chat)
         finally:
